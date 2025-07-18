@@ -1,0 +1,149 @@
+import numpy as np
+import pandas as pd
+from keras.models import load_model
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.preprocessing import MinMaxScaler
+import joblib
+
+# === 配置 ===
+features = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11']
+y_labels = ['yield_dis', 'yield_load', 'peak_dis', 'peak_load', 'ultimate_dis']
+target_label = 'yield_dis'  # 要优化的输出维度
+
+# === 加载数据并划分 ===
+full_df = pd.read_excel('data.xlsx', header=None, names=features + y_labels, engine='openpyxl')
+test_df = full_df.sample(frac=0.2, random_state=19)
+train_df = full_df.drop(test_df.index)
+
+X_train = train_df[features].values
+y_train = train_df[y_labels].values
+X_test = test_df[features].values
+y_test = test_df[y_labels].values
+
+# === 加载模型和归一化器 ===
+model = load_model('trained_bpnn_model_leakyrelu.h5')
+scaler_X = joblib.load('scaler_X.save')
+scaler_y = joblib.load('scaler_y.save')
+
+# === 归一化 ===
+X_train_scaled = scaler_X.transform(X_train)
+X_test_scaled = scaler_X.transform(X_test)
+y_train_scaled = scaler_y.transform(y_train)
+y_test_scaled = scaler_y.transform(y_test)
+
+# === 获取目标维度索引 + 权重层 ===
+output_index = y_labels.index(target_label)
+weight_layer = next(layer for layer in reversed(model.layers) if layer.get_weights())
+original_weights, original_biases = weight_layer.get_weights()
+
+# === 定义反归一化 R2 函数 ===
+def r2_on_denormalized(X_scaled, y_scaled, output_index):
+    y_pred_scaled = model.predict(X_scaled, verbose=0)
+    y_pred = scaler_y.inverse_transform(y_pred_scaled)
+    y_true = scaler_y.inverse_transform(y_scaled)
+    return r2_score(y_true[:, output_index], y_pred[:, output_index])
+
+# === 萤火虫优化器（目标函数为反归一化后的训练集 MAE）===
+class FireflyBPNNOptimizerMAE:
+    def __init__(self, model, output_index, X_train_scaled, y_train_scaled, weight_layer,
+                 n_fireflies=30, max_gen=80, alpha=0.1, beta0=1.0, gamma=0.1):
+        self.model = model
+        self.output_index = output_index
+        self.X_train = X_train_scaled
+        self.y_train = y_train_scaled
+        self.weight_layer = weight_layer
+        self.original_weights, self.original_biases = weight_layer.get_weights()
+        self.dim = self.original_weights.shape[0]
+        self.lb = -2
+        self.ub = 2
+        self.n_fireflies = n_fireflies
+        self.max_gen = max_gen
+        self.alpha = alpha
+        self.beta0 = beta0
+        self.gamma = gamma
+
+        self.fireflies = np.random.uniform(self.lb, self.ub, (n_fireflies, self.dim))
+        self.intensity = np.array([self.evaluate(f) for f in self.fireflies])
+
+    def _set_output_weights(self, new_weights):
+        weights = self.original_weights.copy()
+        weights[:, self.output_index] = new_weights
+        self.weight_layer.set_weights([weights, self.original_biases])
+
+    def evaluate(self, w):
+        self._set_output_weights(w)
+        pred_scaled = self.model.predict(self.X_train, verbose=0)
+        pred = scaler_y.inverse_transform(pred_scaled)
+        true = scaler_y.inverse_transform(self.y_train)
+        return mean_absolute_error(true[:, self.output_index], pred[:, self.output_index])
+
+    def optimize(self):
+        best_idx = np.argmin(self.intensity)
+        best_fitness = self.intensity[best_idx]
+        best_position = self.fireflies[best_idx].copy()
+
+        for gen in range(self.max_gen):
+            for i in range(self.n_fireflies):
+                for j in range(self.n_fireflies):
+                    if self.intensity[j] < self.intensity[i]:
+                        r = np.linalg.norm(self.fireflies[i] - self.fireflies[j])
+                        beta = self.beta0 * np.exp(-self.gamma * r ** 2)
+                        step = self.alpha * (np.random.rand(self.dim) - 0.5)
+                        new_pos = self.fireflies[i] + beta * (self.fireflies[j] - self.fireflies[i]) + step
+                        new_pos = np.clip(new_pos, self.lb, self.ub)
+                        new_fit = self.evaluate(new_pos)
+                        if new_fit < self.intensity[i]:
+                            self.fireflies[i] = new_pos
+                            self.intensity[i] = new_fit
+                            if new_fit < best_fitness:
+                                best_fitness = new_fit
+                                best_position = new_pos.copy()
+
+            self._set_output_weights(best_position)
+
+            # 每代输出训练/测试集 R²
+            train_r2 = r2_on_denormalized(self.X_train, self.y_train, self.output_index)
+            test_r2 = r2_on_denormalized(X_test_scaled, y_test_scaled, self.output_index)
+            print(f"第 {gen + 1} 代，最小训练集 MAE: {best_fitness:.6f}，训练集R2: {train_r2:.6f}，测试集R2: {test_r2:.6f}")
+
+        self._set_output_weights(best_position)
+        return best_position, best_fitness
+
+# === 误差评估函数 ===
+def print_error_metrics(y_true, y_pred, y_labels, title):
+    print(f"\n===== {title} 误差指标（反归一化）=====")
+    for i, label in enumerate(y_labels):
+        mae = mean_absolute_error(y_true[:, i], y_pred[:, i])
+        mse = mean_squared_error(y_true[:, i], y_pred[:, i])
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_true[:, i], y_pred[:, i])
+        mape = mean_absolute_percentage_error(y_true[:, i], y_pred[:, i])
+        print(f"{label:<15} MAE={mae:.6f}  MSE={mse:.6f}  RMSE={rmse:.6f}  R2={r2:.6f}  MAPE={mape:.6f}")
+
+# === 优化前误差评估 ===
+y_train_pred = scaler_y.inverse_transform(model.predict(X_train_scaled))
+y_test_pred = scaler_y.inverse_transform(model.predict(X_test_scaled))
+y_train_true = scaler_y.inverse_transform(y_train_scaled)
+y_test_true = scaler_y.inverse_transform(y_test_scaled)
+
+print_error_metrics(y_train_true, y_train_pred, y_labels, "训练集（优化前）")
+print_error_metrics(y_test_true, y_test_pred, y_labels, "测试集（优化前）")
+
+# === 执行优化 ===
+optimizer = FireflyBPNNOptimizerMAE(
+    model, output_index, X_train_scaled, y_train_scaled, weight_layer,
+    n_fireflies=30, max_gen=80, alpha=0.1, beta0=1.0, gamma=0.1
+)
+best_weights, best_mae = optimizer.optimize()
+print("🔥 萤火虫优化完成，最小训练集 MAE：", best_mae)
+
+# === 优化后误差评估 ===
+y_train_pred_final = scaler_y.inverse_transform(model.predict(X_train_scaled))
+y_test_pred_final = scaler_y.inverse_transform(model.predict(X_test_scaled))
+
+print_error_metrics(y_train_true, y_train_pred_final, y_labels, "训练集（优化后）")
+print_error_metrics(y_test_true, y_test_pred_final, y_labels, "测试集（优化后）")
+
+# === 保存模型 ===
+model.save(f'bpnn_firefly_mae_optimized_{target_label}.h5')
+print(f"✅ 模型已保存为 bpnn_firefly_mae_optimized_{target_label}.h5")
